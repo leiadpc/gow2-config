@@ -8,6 +8,8 @@ comment lines. Standard Python configparser can't round-trip this format
 (it chokes on duplicate keys), so this tool uses a small custom parser that
 preserves section order, duplicate keys, and comments.
 
+Requires Python 3.10+ (uses PEP 604 `X | None` type hints).
+
 Usage:
     python gearengine_ini_editor.py [path/to/GearEngine.ini | path/to/folder]
 
@@ -213,57 +215,79 @@ CHEATS = [
 # Parsing / writing
 # --------------------------------------------------------------------------
 
+def row_kind(col0: str, col1: str) -> str:
+    """Classify a (col0, col1) row as 'comment', 'blank', or 'normal'."""
+    text = col0.strip()
+    if text.startswith(COMMENT_PREFIXES):
+        return "comment"
+    if not text and not col1.strip():
+        return "blank"
+    return "normal"
+
+
 def parse_ini(path: Path):
+    """Returns (section_order, sections, eol) where eol is the file's
+    original line-ending style ("\\r\\n" or "\\n"), preserved so Save
+    doesn't silently rewrite every line ending in the file."""
     section_order = []
     sections = {}
     current = None
 
-    with open(path, "r", encoding="utf-8", errors="replace") as f:
-        for raw_line in f:
-            line = raw_line.rstrip("\r\n")
-            stripped = line.strip()
+    with open(path, "r", encoding="utf-8", errors="replace", newline="") as f:
+        content = f.read()
 
-            if not stripped:
-                continue
+    eol = "\r\n" if "\r\n" in content else "\n"
 
-            m = re.match(r"^\[(.+)\]$", stripped)
-            if m:
-                current = m.group(1)
-                if current not in sections:
-                    sections[current] = []
-                    section_order.append(current)
-                continue
+    for raw_line in content.splitlines():
+        stripped = raw_line.strip()
 
-            if current is None:
-                continue
+        if not stripped:
+            # Preserve blank lines as their own row so round-tripping a
+            # file doesn't flatten deliberate spacing within a section.
+            if current is not None:
+                sections[current].append(["", ""])
+            continue
 
-            if stripped.startswith(COMMENT_PREFIXES):
-                sections[current].append([stripped, ""])
-                continue
+        m = re.match(r"^\[(.+)\]$", stripped)
+        if m:
+            current = m.group(1)
+            if current not in sections:
+                sections[current] = []
+                section_order.append(current)
+            continue
 
-            if "=" in stripped:
-                key, _, value = stripped.partition("=")
-                sections[current].append([key, value])
-            else:
-                sections[current].append([stripped, ""])
+        if current is None:
+            continue
 
-    return section_order, sections
+        if stripped.startswith(COMMENT_PREFIXES):
+            sections[current].append([stripped, ""])
+            continue
+
+        if "=" in stripped:
+            key, _, value = stripped.partition("=")
+            sections[current].append([key.strip(), value.strip()])
+        else:
+            sections[current].append([stripped, ""])
+
+    return section_order, sections, eol
 
 
-def write_ini(path: Path, section_order, sections):
+def write_ini(path: Path, section_order, sections, eol: str = "\n"):
     lines = []
     for sec in section_order:
         lines.append(f"[{sec}]")
         for col0, col1 in sections[sec]:
-            text = col0.strip()
-            if text.startswith(COMMENT_PREFIXES):
+            kind = row_kind(col0, col1)
+            if kind == "comment":
                 lines.append(col0)
+            elif kind == "blank":
+                lines.append("")
             else:
                 lines.append(f"{col0}={col1}")
         lines.append("")
 
-    with open(path, "w", encoding="utf-8", newline="\n") as f:
-        f.write("\n".join(lines) + "\n")
+    with open(path, "w", encoding="utf-8", newline="") as f:
+        f.write(eol.join(lines) + eol)
 
 
 def find_gear_ini_files(folder: Path):
@@ -781,7 +805,7 @@ class IniEditor(QMainWindow):
         errors = []
         for p in paths:
             try:
-                section_order, sections = parse_ini(p)
+                section_order, sections, eol = parse_ini(p)
             except OSError as e:
                 errors.append(f"{p.name}: {e}")
                 continue
@@ -789,6 +813,7 @@ class IniEditor(QMainWindow):
                 "path": p,
                 "section_order": section_order,
                 "sections": sections,
+                "eol": eol,
                 "dirty": False,
             }
 
@@ -845,7 +870,7 @@ class IniEditor(QMainWindow):
             return
         new_path = Path(path)
         try:
-            write_ini(new_path, doc["section_order"], doc["sections"])
+            write_ini(new_path, doc["section_order"], doc["sections"], doc.get("eol", "\n"))
         except OSError as e:
             QMessageBox.critical(self, "Error", f"Could not save file:\n{e}")
             return
@@ -865,7 +890,7 @@ class IniEditor(QMainWindow):
     def save_document(self, name: str):
         doc = self.documents[name]
         try:
-            write_ini(doc["path"], doc["section_order"], doc["sections"])
+            write_ini(doc["path"], doc["section_order"], doc["sections"], doc.get("eol", "\n"))
         except OSError as e:
             QMessageBox.critical(self, "Error", f"Could not save {name}:\n{e}")
             return
@@ -930,6 +955,7 @@ class IniEditor(QMainWindow):
                 continue
             item = QListWidgetItem(name)
             item.setFlags(item.flags() | Qt.ItemIsEditable)
+            item.setData(Qt.UserRole, name)
             self.section_list.addItem(item)
         self.section_list.blockSignals(False)
 
@@ -947,16 +973,14 @@ class IniEditor(QMainWindow):
     def on_section_renamed(self, item: QListWidgetItem):
         if self.current_doc is None:
             return
+        old_name = item.data(Qt.UserRole)
         new_name = item.text().strip()
         if not new_name:
             QMessageBox.warning(self, "Invalid name", "Section name cannot be empty.")
             self.refresh_section_list()
             return
 
-        current_texts = [self.section_list.item(i).text() for i in range(self.section_list.count())]
-        missing = [n for n in self.cur_section_order if n not in current_texts]
-        old_name = missing[0] if missing else None
-        if old_name is None or old_name == new_name:
+        if old_name is None or old_name == new_name or old_name not in self.cur_sections:
             return
         if new_name in self.cur_sections:
             QMessageBox.warning(self, "Duplicate name", f"Section '{new_name}' already exists.")
@@ -1024,10 +1048,10 @@ class IniEditor(QMainWindow):
         self.apply_row_filter()
 
     def _set_row_items(self, row: int, col0: str, col1: str):
-        is_comment = col0.strip().startswith(COMMENT_PREFIXES)
+        kind = row_kind(col0, col1)
         item0 = QTableWidgetItem(col0)
-        item1 = QTableWidgetItem("" if is_comment else col1)
-        if is_comment:
+        item1 = QTableWidgetItem("" if kind != "normal" else col1)
+        if kind != "normal":
             gray = QBrush(QColor(120, 120, 120))
             item0.setForeground(gray)
             item1.setFlags(item1.flags() & ~Qt.ItemIsEditable)
@@ -1118,6 +1142,7 @@ class IniEditor(QMainWindow):
         if not query:
             return
         count = 0
+        truncated = False
         for doc_name, doc in self.documents.items():
             for sec in doc["section_order"]:
                 for row, (col0, col1) in enumerate(doc["sections"][sec]):
@@ -1129,10 +1154,25 @@ class IniEditor(QMainWindow):
                         self.search_results.addItem(item)
                         count += 1
                         if count >= 500:
-                            return
+                            truncated = True
+                            break
+                if truncated:
+                    break
+            if truncated:
+                break
+
+        if truncated:
+            note = QListWidgetItem("500+ matches - refine your search to see more")
+            note.setFlags(Qt.NoItemFlags)
+            gray = QBrush(QColor(120, 120, 120))
+            note.setForeground(gray)
+            self.search_results.addItem(note)
 
     def jump_to_search_result(self, item: QListWidgetItem):
-        doc_name, sec, row = item.data(Qt.UserRole)
+        data = item.data(Qt.UserRole)
+        if not data:
+            return
+        doc_name, sec, row = data
 
         for i in range(self.files_list.count()):
             if self.files_list.item(i).data(Qt.UserRole) == doc_name:
